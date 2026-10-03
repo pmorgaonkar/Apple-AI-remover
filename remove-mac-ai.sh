@@ -248,7 +248,9 @@ download_rows() {
 keep_csv() { printf '%s' "${KEEP[*]:-}" | tr ' ' ','; }
 
 build_profile() {
-  local output="$1" sets="$2" tmp="$output.tmp.$$" domain rows restrictions assets
+  local output="$1" sets="$2"
+  local tmp="${output}.tmp.$"
+  local domain rows restrictions assets
   restrictions="$(restriction_rows)"
   assets="$(download_rows "$sets")"
   mkdir -p "$(dirname "$output")"
