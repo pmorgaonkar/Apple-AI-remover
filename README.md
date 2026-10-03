@@ -1,127 +1,87 @@
-# RemoveMacAI-Bash
+# Apple AI remover
 
-A Bash-first implementation for disabling Apple Intelligence features and resetting selected Apple Intelligence model assets on macOS.
+Bash-first macOS utility for disabling Apple Intelligence-related controls, resetting selected Apple Intelligence model sets through Apple's private UnifiedAssetFramework (UAF), and preventing selected asset re-downloads with a configuration profile.
 
-> **Experimental / advanced users:** this project uses Apple's private
-> `UnifiedAssetFramework` (UAF) and macOS configuration-profile mechanisms.
-> Private APIs and configuration keys can change without notice between macOS
-> releases. Review the code and generated profile before using it on a primary
-> Mac.
-
-## Why this project exists
-
-The original RemoveMacAI project is implemented primarily in Swift with a small
-Objective-C UAF bridge. This project explores how much of that behavior can be
-made transparent and auditable in Bash.
-
-The design deliberately keeps the native portion very small:
-
-```text
-remove-mac-ai.sh
-    |
-    +-- configuration profile
-    +-- feature restrictions
-    +-- download overrides
-    +-- dry-run / status / revert
-    |
-    +-- uaf-reset.m
-            |
-            +-- UnifiedAssetFramework
-            +-- NSXPC
-            +-- ResetAssetSets
-```
-
-Bash handles the policy and orchestration. Objective-C is used only for the
-private UAF/XPC operation.
+**This is an advanced, experimental utility.** Apple-private APIs and configuration-profile keys are undocumented and can change between macOS releases. Review the source before use.
 
 ## Requirements
 
 - macOS 27.x
-- Apple silicon (`arm64`)
-- `/usr/bin/plutil`
-- `/usr/bin/profiles`
-- Apple Clang (`clang`) for building the helper
-- Administrator authorization when macOS requests profile approval/removal
+- Apple silicon (arm64)
+- Apple Clang / Xcode Command Line Tools
+- administrator approval for the system configuration profile
 
-The project intentionally refuses unsupported macOS versions rather than
-guessing at Apple's private asset-service behavior.
+The project intentionally refuses unsupported macOS major versions.
 
-## Before changing anything
+## Architecture
 
-Inspect the repository:
+The shell program owns the catalog, dependency closure, profile generation, state reporting, confirmation flow, and recovery.
 
-```bash
-sed -n '1,260p' remove-mac-ai.sh
-sed -n '1,260p' uaf-reset.m
-```
+The small Objective-C helper is the only component that talks to private Apple APIs:
 
-Validate the platform:
+- `UAFConfigurationManager`
+- `UAFAutoAssetManager`
+- `UAFXPCProxyServiceInterface`
+- XPC service `com.apple.siri.uaf.subscription.service`
 
-```bash
-./remove-mac-ai.sh status
-```
-
-Preview the operation:
-
-```bash
-./remove-mac-ai.sh off --dry-run
-```
-
-The dry-run does not install a profile or call UAF.
+The helper validates every model-set name against an explicit allowlist and checks the live UAF asset type before reading bytes or issuing a reset.
 
 ## Usage
 
-List supported feature identifiers:
+The safest first step is the self-test:
 
 ```bash
-./remove-mac-ai.sh features
+bash remove-mac-ai.sh selftest
 ```
 
-Show current state:
+List the supported feature IDs:
 
 ```bash
-./remove-mac-ai.sh status
+bash remove-mac-ai.sh features
 ```
 
-Preview:
+Inspect current state:
 
 ```bash
-./remove-mac-ai.sh off --dry-run
+bash remove-mac-ai.sh status
+```
+
+Preview changes without installing a profile or resetting models:
+
+```bash
+bash remove-mac-ai.sh off --dry-run
 ```
 
 Apply:
 
 ```bash
-./remove-mac-ai.sh off
+bash remove-mac-ai.sh off
 ```
 
-Non-interactive confirmation:
+Non-interactive mode:
 
 ```bash
-./remove-mac-ai.sh off --yes
+bash remove-mac-ai.sh off --yes
 ```
 
-Keep one feature enabled:
+Keep selected features enabled:
 
 ```bash
-./remove-mac-ai.sh off --keep siri
+bash remove-mac-ai.sh off --keep siri
+bash remove-mac-ai.sh off --keep siri,writing-tools
 ```
 
-Multiple features can be retained by repeating `--keep`:
+Revert this project's configuration profile:
 
 ```bash
-./remove-mac-ai.sh off --keep siri --keep writing-tools
+bash remove-mac-ai.sh revert
 ```
 
-Revert the configuration profile:
+To use `./remove-mac-ai.sh` directly, run `chmod +x remove-mac-ai.sh`.
 
-```bash
-./remove-mac-ai.sh revert
-```
+## Features
 
-## What it changes
-
-The current catalog targets Apple Intelligence-related functionality including:
+The catalog currently covers:
 
 - Siri / Siri AI
 - external intelligence integrations / ChatGPT
@@ -136,134 +96,73 @@ The current catalog targets Apple Intelligence-related functionality including:
 - inline text predictions
 - Spatial Photos
 - Photos Clean Up
-- Xcode predictive completion
+- Xcode predictive code completion
 
-The exact behavior depends on Apple's current macOS implementation.
+Model reset uses dependency closure: a model set is reset only when no kept feature depends on that set.
 
-## Model assets
+## Configuration profile
 
-The project does **not** blindly delete arbitrary directories under `/System`.
+The profile is generated at:
 
-Instead, after profile installation, the native helper asks Apple's asset service
-to reset selected asset sets through UAF:
+`~/Downloads/Apple-AI-remover.mobileconfig`
 
-```text
-Operation = ResetAssetSets
-AssetSets = [...]
-```
+Profile identifier:
 
-This is intentional. Apple's asset layout is private and may change.
+`io.github.pmorgaonkar.apple-ai-remover`
 
-## Preventing re-download
+Payload UUIDs are deterministic for their identifiers, matching the upstream project's stable-UUID design. The profile is removable and contains a forced preference marker used for state detection.
 
-The generated configuration profile sets MobileAsset download overrides for
-the selected asset classes. The current implementation uses a loopback endpoint
-on port 9:
+Selected MobileAsset download overrides point at:
 
-```text
-https://127.0.0.1:9/removemacai-blocked/
-```
+`https://127.0.0.1:9/apple-ai-remover-blocked/`
 
-This is a configuration mechanism, not a network firewall.
+This is a configuration mechanism, not a firewall.
 
-## Generated profile
+## Model handling
 
-The script writes:
+The implementation does not delete arbitrary files under `/System`.
 
-```text
-~/Downloads/RemoveMacAI-Bash.mobileconfig
-```
+For each selected model set, the helper:
 
-Before approving the profile, inspect it:
+1. resolves the UAF asset set;
+2. verifies the live `autoAssetType` against the catalog;
+3. reports `downloadedFilesystemBytes` for status;
+4. sends `ResetAssetSets` through the private XPC service.
 
-```bash
-plutil -p ~/Downloads/RemoveMacAI-Bash.mobileconfig
-```
+Reset requests are made one set at a time so a failure on one set does not silently convert into an empty or broader reset request.
 
-The profile identifier is:
+## Safety and recovery
 
-```text
-io.github.omlahore.removemacai.bash
-```
+The tool does not intentionally modify `/System` or disable SIP.
 
-The profile is intended to be removable. `revert` removes that profile by
-identifier.
+`off` refuses to proceed when either the old Bash implementation's profile or the upstream RemoveMacAI profile is already active. This avoids stacking conflicting forced preferences.
 
-## Security model
+Removing the project's profile restores the user's normal preference scope. Re-downloading Apple Intelligence assets after reversion is expected when Apple features are used again.
 
-This project intentionally does not use:
+## Testing
+
+GitHub Actions runs on macOS and currently performs:
 
 ```text
-curl ... | bash
+bash -n remove-mac-ai.sh
+bash -n build-helper.sh
+Apple Clang build of uaf-reset.m
+bash remove-mac-ai.sh selftest
 ```
 
-as its installation model.
+The CI test environment can verify compilation and catalog/profile invariants; it cannot prove behavior against every macOS build or Apple service deployment. Functional validation of private UAF operations must be performed on an appropriate target Mac.
 
-Clone/download the repository, inspect the files, and execute the local script.
+## Upstream reference
 
-The native helper is compiled locally using Apple's Clang. No precompiled
-binary is required.
-
-### Important security limitations
-
-1. The UAF framework is private Apple software.
-2. The XPC service name and interfaces are undocumented/private.
-3. Configuration-profile keys can change.
-4. This repository has no authority from Apple.
-5. A macOS update may make the tool partially or completely ineffective.
-6. The project has not been independently security audited.
-
-Do not treat the project as a security product.
-
-## Recovery
-
-If the operation completes but behavior is unexpected:
-
-```bash
-./remove-mac-ai.sh revert
-```
-
-Then reboot if macOS still shows stale feature state.
-
-If the profile is visible in System Settings, it can also be removed there.
-
-The project does not intentionally modify `/System` or disable System Integrity
-Protection.
-
-## Relationship to the upstream project
-
-This repository is an independent Bash-first implementation inspired by the
-public implementation and documented behavior of:
+The implementation was developed by inspecting the public source of:
 
 https://github.com/omlahore/RemoveMacAI
 
-It is not the upstream project and is not affiliated with Apple.
+Reference revision:
 
-## Development
+`609503f1e2e71c139779da2e1f23b813a7fcafef`
 
-Check shell syntax:
-
-```bash
-bash -n remove-mac-ai.sh
-```
-
-Compile the helper manually:
-
-```bash
-clang -O2 -fobjc-arc -framework Foundation   -o uaf-reset uaf-reset.m
-```
-
-Remove the generated local binary before committing:
-
-```bash
-rm -f uaf-reset
-```
-
-## Versioning
-
-The project currently starts at `0.1.0` because the implementation is
-experimental and has not yet established compatibility across multiple macOS
-27 point releases.
+This repository is an independent implementation and is not affiliated with Apple or the upstream project.
 
 ## License
 
