@@ -265,15 +265,20 @@ append_pref_payload() {
 build_profile() {
   local output="$1" sets="$2" tmp="$output.tmp.$$"
   local feature domain key value set d
+
   ALL_PREFS=''
   for feature in "${FEATURES[@]}"; do
     kept "$feature" && continue
     while IFS=$'\t' read -r domain key value; do
       [[ -n "$domain" ]] || continue
-      ALL_PREFS="${ALL_PREFS}${domain}"
+      ALL_PREFS="${ALL_PREFS}${domain}"$'\t'"${key}"$'\t'"${value}"$'\n'
+    done < <(feature_preferences "$feature")
+  done
+
+  while IFS= read -r set; do
     [[ -n "$set" ]] || continue
     key="DownloadServerBaseURLOverride-$(model_set_asset_type "$set")"
-    PREF_LINES="${PREF_LINES}com.apple.MobileAsset"$'\t'"${key}"$'\t'"${BLOCKED_URL}"$'\n'
+    ALL_PREFS="${ALL_PREFS}com.apple.MobileAsset"$'\t'"${key}"$'\t'"${BLOCKED_URL}"$'\n'
   done <<< "$sets"
 
   mkdir -p "$(dirname "$output")"
@@ -323,7 +328,11 @@ build_profile() {
 
     printf '%s\n' '</array></dict></plist>'
   } > "$tmp"
-  /usr/bin/plutil -lint "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; fail 'generated profile failed plist validation'; }
+
+  /usr/bin/plutil -lint "$tmp" >/dev/null 2>&1 || {
+    rm -f "$tmp"
+    fail 'generated profile failed plist validation'
+  }
   mv "$tmp" "$output"
 }
 
