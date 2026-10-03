@@ -1,0 +1,19 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell syntax
+        run: |
+          bash -n remove-mac-ai.sh
+          bash -n build-helper.sh
+      - name: Build native helper
+        run: ./build-helper.sh "$RUNNER_TEMP/uaf-reset"
+      - name: Catalog self-test
+        run: ./remove-mac-ai.sh selftest
