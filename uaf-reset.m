@@ -68,7 +68,13 @@ fail:
 static int commandBytes(NSString *name) {
     NSError *error=nil;
     if (!loadUAF(&error)) goto fail;
-    if (!expectedAssetType(name)) { fprintf(stderr,"uaf-reset: unknown asset set: %s\n",name.UTF8String); return 2; }
+    NSString *expected=expectedAssetType(name);
+    if (!expected) { fprintf(stderr,"uaf-reset: unknown asset set: %s\n",name.UTF8String); return 2; }
+    NSString *actual=uafAssetType(name);
+    if (!actual || ![actual isEqualToString:expected]) {
+        fprintf(stderr,"uaf-reset: live UAF asset type mismatch for: %s\n",name.UTF8String);
+        return 1;
+    }
     Class manager=NSClassFromString(@"UAFAutoAssetManager");
     if (!manager || ![manager respondsToSelector:@selector(latestStatusForClients:error:)]) { fprintf(stderr,"uaf-reset: UAF status interface unavailable\n"); return 1; }
     id status=[manager latestStatusForClients:name error:&error];
