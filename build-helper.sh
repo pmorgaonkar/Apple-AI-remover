@@ -1,9 +1,13 @@
 #!/bin/bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+output="${1:-./uaf-reset}"
+script_dir="$(cd "$(dirname "$0")" && pwd)"
 
-clang -O2 -fobjc-arc -framework Foundation -o uaf-reset uaf-reset.m
+command -v clang >/dev/null 2>&1 || { echo 'error: clang is required' >&2; exit 1; }
+[[ -r "$script_dir/uaf-reset.m" ]] || { echo 'error: uaf-reset.m is missing' >&2; exit 1; }
 
-echo "Built ./uaf-reset"
+clang -O2 -fobjc-arc -framework Foundation -framework CoreFoundation \
+  -o "$output" "$script_dir/uaf-reset.m"
+chmod 755 "$output"
+printf 'built %s\n' "$output"
