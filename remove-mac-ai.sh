@@ -188,7 +188,8 @@ stable_uuid() {
 }
 
 payload_header() {
-  local type="$1" suffix="$2" display="$3" id="$PROFILE_ID.$suffix"
+  local type="$1" suffix="$2" display="$3"
+  local id="$PROFILE_ID.$suffix"
   printf '%s\n' '<dict>'
   printf '<key>PayloadType</key><string>%s</string>\n' "$(xml_escape "$type")"
   printf '%s\n' '<key>PayloadVersion</key><integer>1</integer>'
@@ -198,7 +199,8 @@ payload_header() {
 }
 
 emit_pref_payload() {
-  local domain="$1" suffix="$2" display="$3" rows="$4" key value
+  local domain="$1" suffix="$2" display="$3" rows="$4"
+  local key value
   [[ -n "$rows" ]] || return 0
   payload_header com.apple.ManagedClient.preferences "preferences.$suffix" "$display"
   printf '%s\n' '      <key>PayloadContent</key><dict>'
