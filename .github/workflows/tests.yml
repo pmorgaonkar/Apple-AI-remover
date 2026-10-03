@@ -14,6 +14,6 @@ jobs:
           bash -n remove-mac-ai.sh
           bash -n build-helper.sh
       - name: Build native helper
-        run: ./build-helper.sh "$RUNNER_TEMP/uaf-reset"
+        run: bash ./build-helper.sh "$RUNNER_TEMP/uaf-reset"
       - name: Catalog self-test
-        run: ./remove-mac-ai.sh selftest
+        run: bash ./remove-mac-ai.sh selftest
