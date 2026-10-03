@@ -3,6 +3,17 @@
 #import <dlfcn.h>
 #import <objc/runtime.h>
 
+@interface NSObject (AppleAIRemoverUAFPrivate)
++ (id)defaultManager;
++ (NSXPCInterface *)defaultInterface;
++ (id)latestStatusForClients:(NSString *)name error:(NSError **)error;
+- (id)getAssetSet:(NSString *)name;
+- (NSString *)autoAssetType;
+- (int64_t)downloadedFilesystemBytes;
+- (oneway void)operationWithConfig:(NSDictionary *)configuration
+                        completion:(void (^)(NSError *_Nullable error))completion;
+@end
+
 static NSString * const kFramework = @"/System/Library/PrivateFrameworks/UnifiedAssetFramework.framework/UnifiedAssetFramework";
 static NSString * const kService = @"com.apple.siri.uaf.subscription.service";
 
