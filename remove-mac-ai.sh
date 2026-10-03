@@ -355,7 +355,7 @@ upstream_profile_installed() {
 profile_kept_csv() {
   local output
   output="$(helper_pref "$PROFILE_ID" kept 2>/dev/null)" || return 1
-  printf '%s' "\${output#*value=}"
+  printf '%s' "${output#*value=}"
 }
 
 validate_uaf_catalog() {
@@ -382,30 +382,37 @@ format_bytes() {
 }
 
 feature_state() {
-  local feature="$1" domain key want output forced value
-  local all=1 any=0
+  local feature="$1" domain key want output
+  local pref_has=0 pref_forced_off=1 pref_values_off=1
+  local restriction_has=0 restriction_forced_off=1
+
   while IFS=$'\t' read -r domain key want; do
     [[ -n "$domain" ]] || continue
+    pref_has=1
     output="$(helper_pref "$domain" "$key" 2>/dev/null)" || { echo unknown; return; }
-    forced="$(printf '%s' "$output" | sed -n 's/.*forced=\([^\t]*\).*/\1/p')"
-    value="$(printf '%s' "$output" | sed -n 's/.*value=\([^\t]*\)$/\1/p')"
-    [[ "$forced" == 1 && "$value" == "$want" ]] && any=1 || all=0
+    [[ "$output" == "forced=1"$'\t'"value=$want" ]] || pref_forced_off=0
+    [[ "$output" == *$'\t'"value=$want" ]] || pref_values_off=0
   done < <(feature_preferences "$feature")
-  if (( all == 1 && any == 1 )); then echo locked; return; fi
 
-  case "$feature" in
-    chatgpt|writing-tools|genmoji|image-playground|safari-summaries|notes-summaries)
-      local restricted_ok=1 r
-      while IFS= read -r r; do
-        [[ -n "$r" ]] || continue
-        output="$(helper_pref com.apple.applicationaccess "$r" 2>/dev/null)" || { echo unknown; return; }
-        [[ "$output" == *$'forced=1\tvalue=false'* ]] || restricted_ok=0
-      done < <(feature_restrictions "$feature")
-      (( restricted_ok == 1 )) && echo locked && return
-      ;;
-  esac
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    restriction_has=1
+    output="$(helper_pref com.apple.applicationaccess "$key" 2>/dev/null)" || { echo unknown; return; }
+    [[ "$output" == *$'forced=1\tvalue=false'* ]] || restriction_forced_off=0
+  done < <(feature_restrictions "$feature")
 
-  if profile_installed && ! kept "$feature" && [[ -z "$(feature_preferences "$feature")" ]] && [[ -z "$(feature_restrictions "$feature")" ]]; then
+  if (( pref_has == 1 || restriction_has == 1 )); then
+    if (( (pref_has == 0 || pref_forced_off == 1) && (restriction_has == 0 || restriction_forced_off == 1) )); then
+      echo locked
+    elif (( pref_has == 1 && pref_values_off == 1 )); then
+      echo off
+    else
+      echo on
+    fi
+    return
+  fi
+
+  if profile_installed && ! kept "$feature"; then
     echo locked
     return
   fi
@@ -416,7 +423,13 @@ feature_state() {
     if ! n="$(model_bytes "$set")"; then known=0; break; fi
     total=$((total+n))
   done < <(feature_model_sets "$feature")
-  if (( known == 0 )); then echo unknown; elif (( total > 0 )); then echo on; else echo off; fi
+  if (( known == 0 )); then
+    echo unknown
+  elif (( total > 0 )); then
+    echo on
+  else
+    echo off
+  fi
 }
 
 status_command() {
