@@ -337,8 +337,26 @@ keep_csv() {
 }
 
 helper_pref() { "$HELPER" pref "$1" "$2"; }
-profile_installed() { local o; o="$(helper_pref "$PROFILE_ID" installed 2>/dev/null)" || return 1; [[ "$o" == *$'forced=1\tvalue=true'* ]]; }
-legacy_profile_installed() { local o; o="$(helper_pref "$LEGACY_PROFILE_ID" installed 2>/dev/null)" || return 1; [[ "$o" == * { local o; o="$(helper_pref "$PROFILE_ID" kept 2>/dev/null)" || return 1; printf '%s' "${o#*value=}"; }
+profile_installed() {
+  local output
+  output="$(helper_pref "$PROFILE_ID" installed 2>/dev/null)" || return 1
+  [[ "$output" == *$'forced=1\tvalue=true'* ]]
+}
+legacy_profile_installed() {
+  local output
+  output="$(helper_pref "$LEGACY_PROFILE_ID" installed 2>/dev/null)" || return 1
+  [[ "$output" == *$'forced=1\tvalue=true'* ]]
+}
+upstream_profile_installed() {
+  local output
+  output="$(helper_pref "$UPSTREAM_PROFILE_ID" installed 2>/dev/null)" || return 1
+  [[ "$output" == *$'forced=1\tvalue=true'* ]]
+}
+profile_kept_csv() {
+  local output
+  output="$(helper_pref "$PROFILE_ID" kept 2>/dev/null)" || return 1
+  printf '%s' "\${output#*value=}"
+}
 
 validate_uaf_catalog() {
   local set expected actual
