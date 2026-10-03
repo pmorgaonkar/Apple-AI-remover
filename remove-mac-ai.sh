@@ -281,12 +281,616 @@ restriction_lines() {
 }
 
 download_lines() {
-  local set key lines=''
+  local sets="$1" set key lines=''
   while IFS= read -r set; do
     [[ -n "$set" ]] || continue
     key="DownloadServerBaseURLOverride-$(model_set_asset_type "$set")"
-    lines="${lines}${key}"$'\t'"${BLOCKED_URL}"$'\n'
-  done < <(sets_to_remove)
+    lines="${lines}${key}"
+
+build_profile() {
+  local output="$1" sets="$2" tmp="$output.tmp.$$" domain lines key
+  local restrictions="$(restriction_lines)"
+  local assets="$(download_lines "$sets")"
+  mkdir -p "$(dirname "$output")"
+  {
+    printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>'
+    printf '%s\n' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList 1.0//EN">'
+    printf '%s\n' '<plist version="1.0"><dict>'
+    printf '%s\n' '<key>PayloadType</key><string>Configuration</string>'
+    printf '%s\n' '<key>PayloadVersion</key><integer>1</integer>'
+    printf '<key>PayloadIdentifier</key><string>%s</string>\n' "$PROFILE_ID"
+    printf '<key>PayloadUUID</key><string>%s</string>\n' "$(stable_uuid "$PROFILE_ID")"
+    printf '<key>PayloadDisplayName</key><string>%s</string>\n' "$(xml_escape "$PROFILE_NAME")"
+    printf '%s\n' '<key>PayloadDescription</key><string>Disables Apple Intelligence features and blocks selected model downloads. Remove this profile to undo.</string>'
+    printf '%s\n' '<key>PayloadOrganization</key><string>Apple AI remover</string>'
+    printf '%s\n' '<key>PayloadScope</key><string>System</string>'
+    printf '%s\n' '<key>PayloadRemovalDisallowed</key><false/>'
+    printf '%s\n' '<key>PayloadContent</key><array>'
+
+    if [[ -n "$restrictions" ]]; then
+      payload_header com.apple.applicationaccess restrictions 'Apple Intelligence restrictions'
+      printf '%s\n' '      <key>PayloadContent</key><dict>'
+      while IFS= read -r key; do
+        [[ -n "$key" ]] && printf '        <key>%s</key><false/>\n' "$(xml_escape "$key")"
+      done <<< "$restrictions"
+      printf '%s\n' '      </dict></dict>'
+    fi
+
+    for domain in com.apple.assistant.support com.apple.Siri group.com.apple.mail group.com.apple.usernoted com.apple.MobileSMS .GlobalPreferences com.apple.spatialphotosrelive; do
+      lines="$(domain_preference_lines "$domain")"
+      emit_preferences_payload "$domain" "$domain" "Forced settings: $domain" "$lines"
+    done
+    emit_preferences_payload com.apple.MobileAsset MobileAsset 'MobileAsset download overrides' "$assets"
+
+    lines="installed"$'\t'true$'\n'"kept"$'\t'"$(printf '%s' "${KEEP[*]:-}" | tr ' ' ',')"$'\n'
+    emit_preferences_payload "$PROFILE_ID" marker 'Apple AI remover state' "$lines"
+
+    printf '%s\n' '</array></dict></plist>'
+  } > "$tmp"
+  /usr/bin/plutil -lint "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; fail 'generated profile failed plist validation'; }
+  mv "$tmp" "$output"
+}
+
+helper_pref() { "$HELPER" pref "$1" "$2"; }
+profile_installed() { local output; output="$(helper_pref "$PROFILE_ID" installed 2>/dev/null)" || return 1; [[ "$output" == *$'forced=1\tvalue=true'* ]]; }
+legacy_profile_installed() { local output; output="$(helper_pref "$LEGACY_PROFILE_ID" installed 2>/dev/null)" || return 1; [[ "$output" == *$'forced=1\tvalue=true'* ]]; }
+upstream_profile_installed() { local output; output="$(helper_pref "$UPSTREAM_PROFILE_ID" installed 2>/dev/null)" || return 1; [[ "$output" == *$'forced=1\tvalue=true'* ]]; }
+profile_kept_csv() { local output; output="$(helper_pref "$PROFILE_ID" kept 2>/dev/null)" || return 1; printf '%s' "${output#*value=}"; }
+
+validate_uaf_catalog() {
+  local set expected actual
+  for set in "${MODEL_SETS[@]}"; do
+    expected="$(model_set_asset_type "$set")"
+    actual="$($HELPER asset-type "$set")" || fail "UAF lookup failed for $set"
+    [[ "$actual" == "$expected" ]] || fail "UAF mapping mismatch for $set: expected $expected, got $actual"
+  done
+}
+
+model_bytes() {
+  local set="$1" output
+  output="$($HELPER bytes "$set" 2>/dev/null)" || return 1
+  [[ "$output" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$output"
+}
+
+format_bytes() {
+  local b="$1"
+  if (( b >= 1000000000 )); then awk -v n="$b" 'BEGIN { printf "%.1f GB", n/1e9 }'
+  elif (( b > 0 )); then awk -v n="$b" 'BEGIN { printf "%.0f MB", n/1e6 }'
+  else echo '0 MB'; fi
+}
+
+feature_state() {
+  local feature="$1" domain key want output
+  local pref_has=0 pref_forced_off=1 pref_values_off=1
+  local restriction_has=0 restriction_forced_off=1
+
+  while IFS=$'\t' read -r domain key want; do
+    [[ -n "$domain" ]] || continue
+    pref_has=1
+    output="$(helper_pref "$domain" "$key" 2>/dev/null)" || { echo unknown; return; }
+    [[ "$output" == "forced=1"$'\t'"value=$want" ]] || pref_forced_off=0
+    [[ "$output" == *$'\t'"value=$want" ]] || pref_values_off=0
+  done < <(feature_preferences "$feature")
+
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    restriction_has=1
+    output="$(helper_pref com.apple.applicationaccess "$key" 2>/dev/null)" || { echo unknown; return; }
+    [[ "$output" == *$'forced=1\tvalue=false'* ]] || restriction_forced_off=0
+  done < <(feature_restrictions "$feature")
+
+  if (( pref_has == 1 || restriction_has == 1 )); then
+    if (( (pref_has == 0 || pref_forced_off == 1) && (restriction_has == 0 || restriction_forced_off == 1) )); then
+      echo locked
+    elif (( pref_has == 1 && pref_values_off == 1 )); then
+      echo off
+    else
+      echo on
+    fi
+    return
+  fi
+
+  if profile_installed && ! kept "$feature"; then
+    echo locked
+    return
+  fi
+
+  local set total=0 known=1 n
+  while IFS= read -r set; do
+    [[ -n "$set" ]] || continue
+    if ! n="$(model_bytes "$set")"; then known=0; break; fi
+    total=$((total+n))
+  done < <(feature_model_sets "$feature")
+  if (( known == 0 )); then echo unknown; elif (( total > 0 )); then echo on; else echo off; fi
+}
+
+status_command() {
+  build_helper
+  printf '%s %s · macOS %s\n\n' "$PRODUCT_NAME" "$VERSION" "$(sw_vers -productVersion)"
+  local feature set state bytes total=0
+  printf 'Features\n'
+  for feature in "${FEATURES[@]}"; do
+    state="$(feature_state "$feature")"
+    printf '  %-42s %s\n' "$(feature_title "$feature")" "$state"
+  done
+  printf '\nModels on disk\n'
+  for set in "${MODEL_SETS[@]}"; do
+    if bytes="$(model_bytes "$set")"; then
+      total=$((total+bytes))
+      printf '  %-42s %s\n' "$(model_set_title "$set")" "$(format_bytes "$bytes")"
+    else
+      printf '  %-42s unknown\n' "$(model_set_title "$set")"
+    fi
+  done
+  printf '  %-42s %s\n' Total "$(format_bytes "$total")"
+  if profile_installed; then printf 'Profile: installed\n'; else printf 'Profile: not-installed\n'; fi
+}
+
+print_features() {
+  local f
+  for f in "${FEATURES[@]}"; do printf '%-28s %s\n' "$f" "$(feature_title "$f")"; done
+}
+
+open_profile_settings() {
+  open 'x-apple.systempreferences:com.apple.Profiles-Settings.extension' 2>/dev/null ||
+    open 'x-apple.systempreferences:com.apple.preferences.configurationprofiles' 2>/dev/null || true
+}
+
+wait_for_profile() {
+  local expected="$1" seconds=0
+  while (( seconds < 600 )); do
+    if profile_installed && [[ "$(profile_kept_csv || true)" == "$expected" ]]; then return 0; fi
+    sleep 2
+    seconds=$((seconds+2))
+  done
+  return 1
+}
+
+reset_models() {
+  local set failures=0
+  while IFS= read -r set; do
+    [[ -n "$set" ]] || continue
+    if "$HELPER" reset "$set"; then
+      info "reset: $set"
+    else
+      warn "asset reset failed: $set"
+      failures=$((failures+1))
+    fi
+  done <<< "$1"
+  return "$failures"
+}
+
+confirm() {
+  (( YES == 1 )) && return 0
+  [[ -t 0 ]] || fail 'run in a terminal or pass --yes'
+  printf 'Turn off Apple Intelligence and reset selected models? [y/N] '
+  read -r answer
+  [[ "$answer" =~ ^[Yy]([Ee][Ss])?$ ]]
+}
+
+off_command() {
+  parse_args "$@"
+  build_helper
+  if legacy_profile_installed || upstream_profile_installed; then
+    fail 'another RemoveMacAI profile is installed; remove it before using this implementation'
+  fi
+  validate_uaf_catalog
+  local sets="$(sets_to_remove)" feature expected
+  printf 'Features to disable:\n'
+  for feature in "${FEATURES[@]}"; do kept "$feature" || printf '  - %s\n' "$(feature_title "$feature")"; done
+  printf 'Model sets to reset:\n'
+  if [[ -n "$sets" ]]; then printf '%s\n' "$sets" | sed 's/^/  - /'; else printf '  - none\n'; fi
+
+  if (( DRY_RUN == 1 )); then
+    local dry="${TMPDIR:-/tmp}/Apple-AI-remover.$$.mobileconfig"
+    build_profile "$dry" "$sets"
+    info 'DRY RUN: no profile was installed and no model was reset.'
+    info "generated profile: $dry"
+    return 0
+  fi
+
+  confirm || { info 'Nothing changed.'; return 0; }
+  expected="$(printf '%s' "${KEEP[*]:-}" | tr ' ' ',')"
+  build_profile "$PROFILE_FILE" "$sets"
+  open "$PROFILE_FILE" 2>/dev/null || true
+  open_profile_settings
+  info "Approve '$PROFILE_NAME' in System Settings."
+  wait_for_profile "$expected" || fail 'profile installation was not observed; no model reset was attempted'
+
+  if [[ -n "$sets" ]]; then
+    reset_models "$sets" || fail 'one or more selected model sets failed to reset; run status to inspect the remaining state'
+  fi
+  info 'Done. Run: ./remove-mac-ai.sh status'
+}
+
+revert_command() {
+  build_helper
+  local current=0 legacy=0
+  profile_installed && current=1
+  legacy_profile_installed && legacy=1
+  if (( current == 0 && legacy == 0 )); then info 'No Apple AI remover profile is installed.'; return 0; fi
+  if (( YES == 0 )); then
+    [[ -t 0 ]] || fail 'run in a terminal or pass --yes'
+    printf 'Remove Apple AI remover profile(s)? [y/N] '
+    read -r answer
+    [[ "$answer" =~ ^[Yy]([Ee][Ss])?$ ]] || { info 'Nothing changed.'; return 0; }
+  fi
+  (( current == 1 )) && sudo /usr/bin/profiles remove -identifier "$PROFILE_ID"
+  (( legacy == 1 )) && sudo /usr/bin/profiles remove -identifier "$LEGACY_PROFILE_ID"
+  local seconds=0
+  while (( seconds < 120 )); do
+    ! profile_installed && ! legacy_profile_installed && { info 'Profile(s) removed.'; return 0; }
+    sleep 1
+    seconds=$((seconds+1))
+  done
+  fail 'profile removal was not observed after 120 seconds'
+}
+
+selftest_command() {
+  need_cmd shasum
+  need_cmd plutil
+  local feature set all test_keep tmp
+  for feature in "${FEATURES[@]}"; do
+    feature_title "$feature" >/dev/null || fail "missing title for $feature"
+    while IFS= read -r set; do
+      [[ -z "$set" ]] || model_set_asset_type "$set" >/dev/null || fail "unknown model set $set"
+    done < <(feature_model_sets "$feature")
+  done
+  for set in "${MODEL_SETS[@]}"; do model_set_asset_type "$set" >/dev/null || fail "missing model-set mapping $set"; done
+  KEEP=()
+  all="$(sets_to_remove)"
+  [[ "$(printf '%s\n' "$all" | sort)" == "$(printf '%s\n' "${MODEL_SETS[@]}" | sort)" ]] || fail 'empty keep set must remove every model set'
+  KEEP=(writing-tools)
+  all="$(sets_to_remove)"
+  grep -qx 'com.apple.modelcatalog' <<< "$all" && fail 'writing-tools must protect foundation models'
+  grep -qx 'com.apple.MobileAsset.UAF.FM.Visual' <<< "$all" || fail 'writing-tools must not protect visual models'
+  KEEP=()
+  test_keep="$(stable_uuid "$PROFILE_ID")"
+  [[ "$test_keep" == "$(stable_uuid "$PROFILE_ID")" ]] || fail 'payload UUIDs are not stable'
+  tmp="${TMPDIR:-/tmp}/apple-ai-remover-selftest.$$.mobileconfig"
+  build_profile "$tmp" "$(sets_to_remove)"
+  /usr/bin/plutil -lint "$tmp" >/dev/null 2>&1 || fail 'self-test profile is not valid plist'
+  grep -q 'DownloadServerBaseURLOverride-com.apple.MobileAsset.UAF.FM.GenerativeModels' "$tmp" || fail 'self-test profile lacks foundation model download override'
+  rm -f "$tmp"
+  printf 'selftest: PASS (%s features, %s model sets)\n' "${#FEATURES[@]}" "${#MODEL_SETS[@]}"
+}
+
+usage() {
+  cat <<EOF
+$PRODUCT_NAME $VERSION
+
+Usage:
+  $0 status
+  $0 features
+  $0 off [--keep feature[,feature...]] [--dry-run] [--yes]
+  $0 revert [--yes]
+  $0 selftest
+
+Mutating commands target macOS $TARGET_MAJOR.x on Apple silicon.
+EOF
+}
+
+main() {
+  local command="${1:-status}"
+  shift || true
+  case "$command" in
+    status) require_platform; status_command "$@" ;;
+    features) [[ $# -eq 0 ]] || fail 'features takes no options'; print_features ;;
+    off) require_platform; off_command "$@" ;;
+    revert) require_platform; parse_args "$@"; revert_command ;;
+    selftest) [[ $# -eq 0 ]] || fail 'selftest takes no options'; selftest_command ;;
+    --help|-h|help) usage ;;
+    --version|-v|version) echo "$VERSION" ;;
+    *) usage >&2; exit 1 ;;
+  esac
+}
+
+main "$@"
+\t'"${BLOCKED_URL}"
+
+build_profile() {
+  local output="$1" sets="$2" tmp="$output.tmp.$$" domain lines key
+  local restrictions="$(restriction_lines)"
+  local assets="$(download_lines)"
+  mkdir -p "$(dirname "$output")"
+  {
+    printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>'
+    printf '%s\n' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList 1.0//EN">'
+    printf '%s\n' '<plist version="1.0"><dict>'
+    printf '%s\n' '<key>PayloadType</key><string>Configuration</string>'
+    printf '%s\n' '<key>PayloadVersion</key><integer>1</integer>'
+    printf '<key>PayloadIdentifier</key><string>%s</string>\n' "$PROFILE_ID"
+    printf '<key>PayloadUUID</key><string>%s</string>\n' "$(stable_uuid "$PROFILE_ID")"
+    printf '<key>PayloadDisplayName</key><string>%s</string>\n' "$(xml_escape "$PROFILE_NAME")"
+    printf '%s\n' '<key>PayloadDescription</key><string>Disables Apple Intelligence features and blocks selected model downloads. Remove this profile to undo.</string>'
+    printf '%s\n' '<key>PayloadOrganization</key><string>Apple AI remover</string>'
+    printf '%s\n' '<key>PayloadScope</key><string>System</string>'
+    printf '%s\n' '<key>PayloadRemovalDisallowed</key><false/>'
+    printf '%s\n' '<key>PayloadContent</key><array>'
+
+    if [[ -n "$restrictions" ]]; then
+      payload_header com.apple.applicationaccess restrictions 'Apple Intelligence restrictions'
+      printf '%s\n' '      <key>PayloadContent</key><dict>'
+      while IFS= read -r key; do
+        [[ -n "$key" ]] && printf '        <key>%s</key><false/>\n' "$(xml_escape "$key")"
+      done <<< "$restrictions"
+      printf '%s\n' '      </dict></dict>'
+    fi
+
+    for domain in com.apple.assistant.support com.apple.Siri group.com.apple.mail group.com.apple.usernoted com.apple.MobileSMS .GlobalPreferences com.apple.spatialphotosrelive; do
+      lines="$(domain_preference_lines "$domain")"
+      emit_preferences_payload "$domain" "$domain" "Forced settings: $domain" "$lines"
+    done
+    emit_preferences_payload com.apple.MobileAsset MobileAsset 'MobileAsset download overrides' "$assets"
+
+    lines="installed"$'\t'true$'\n'"kept"$'\t'"$(printf '%s' "${KEEP[*]:-}" | tr ' ' ',')"$'\n'
+    emit_preferences_payload "$PROFILE_ID" marker 'Apple AI remover state' "$lines"
+
+    printf '%s\n' '</array></dict></plist>'
+  } > "$tmp"
+  /usr/bin/plutil -lint "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; fail 'generated profile failed plist validation'; }
+  mv "$tmp" "$output"
+}
+
+helper_pref() { "$HELPER" pref "$1" "$2"; }
+profile_installed() { local output; output="$(helper_pref "$PROFILE_ID" installed 2>/dev/null)" || return 1; [[ "$output" == *$'forced=1\tvalue=true'* ]]; }
+legacy_profile_installed() { local output; output="$(helper_pref "$LEGACY_PROFILE_ID" installed 2>/dev/null)" || return 1; [[ "$output" == *$'forced=1\tvalue=true'* ]]; }
+upstream_profile_installed() { local output; output="$(helper_pref "$UPSTREAM_PROFILE_ID" installed 2>/dev/null)" || return 1; [[ "$output" == *$'forced=1\tvalue=true'* ]]; }
+profile_kept_csv() { local output; output="$(helper_pref "$PROFILE_ID" kept 2>/dev/null)" || return 1; printf '%s' "${output#*value=}"; }
+
+validate_uaf_catalog() {
+  local set expected actual
+  for set in "${MODEL_SETS[@]}"; do
+    expected="$(model_set_asset_type "$set")"
+    actual="$($HELPER asset-type "$set")" || fail "UAF lookup failed for $set"
+    [[ "$actual" == "$expected" ]] || fail "UAF mapping mismatch for $set: expected $expected, got $actual"
+  done
+}
+
+model_bytes() {
+  local set="$1" output
+  output="$($HELPER bytes "$set" 2>/dev/null)" || return 1
+  [[ "$output" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$output"
+}
+
+format_bytes() {
+  local b="$1"
+  if (( b >= 1000000000 )); then awk -v n="$b" 'BEGIN { printf "%.1f GB", n/1e9 }'
+  elif (( b > 0 )); then awk -v n="$b" 'BEGIN { printf "%.0f MB", n/1e6 }'
+  else echo '0 MB'; fi
+}
+
+feature_state() {
+  local feature="$1" domain key want output
+  local pref_has=0 pref_forced_off=1 pref_values_off=1
+  local restriction_has=0 restriction_forced_off=1
+
+  while IFS=$'\t' read -r domain key want; do
+    [[ -n "$domain" ]] || continue
+    pref_has=1
+    output="$(helper_pref "$domain" "$key" 2>/dev/null)" || { echo unknown; return; }
+    [[ "$output" == "forced=1"$'\t'"value=$want" ]] || pref_forced_off=0
+    [[ "$output" == *$'\t'"value=$want" ]] || pref_values_off=0
+  done < <(feature_preferences "$feature")
+
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    restriction_has=1
+    output="$(helper_pref com.apple.applicationaccess "$key" 2>/dev/null)" || { echo unknown; return; }
+    [[ "$output" == *$'forced=1\tvalue=false'* ]] || restriction_forced_off=0
+  done < <(feature_restrictions "$feature")
+
+  if (( pref_has == 1 || restriction_has == 1 )); then
+    if (( (pref_has == 0 || pref_forced_off == 1) && (restriction_has == 0 || restriction_forced_off == 1) )); then
+      echo locked
+    elif (( pref_has == 1 && pref_values_off == 1 )); then
+      echo off
+    else
+      echo on
+    fi
+    return
+  fi
+
+  if profile_installed && ! kept "$feature"; then
+    echo locked
+    return
+  fi
+
+  local set total=0 known=1 n
+  while IFS= read -r set; do
+    [[ -n "$set" ]] || continue
+    if ! n="$(model_bytes "$set")"; then known=0; break; fi
+    total=$((total+n))
+  done < <(feature_model_sets "$feature")
+  if (( known == 0 )); then echo unknown; elif (( total > 0 )); then echo on; else echo off; fi
+}
+
+status_command() {
+  build_helper
+  printf '%s %s · macOS %s\n\n' "$PRODUCT_NAME" "$VERSION" "$(sw_vers -productVersion)"
+  local feature set state bytes total=0
+  printf 'Features\n'
+  for feature in "${FEATURES[@]}"; do
+    state="$(feature_state "$feature")"
+    printf '  %-42s %s\n' "$(feature_title "$feature")" "$state"
+  done
+  printf '\nModels on disk\n'
+  for set in "${MODEL_SETS[@]}"; do
+    if bytes="$(model_bytes "$set")"; then
+      total=$((total+bytes))
+      printf '  %-42s %s\n' "$(model_set_title "$set")" "$(format_bytes "$bytes")"
+    else
+      printf '  %-42s unknown\n' "$(model_set_title "$set")"
+    fi
+  done
+  printf '  %-42s %s\n' Total "$(format_bytes "$total")"
+  if profile_installed; then printf 'Profile: installed\n'; else printf 'Profile: not-installed\n'; fi
+}
+
+print_features() {
+  local f
+  for f in "${FEATURES[@]}"; do printf '%-28s %s\n' "$f" "$(feature_title "$f")"; done
+}
+
+open_profile_settings() {
+  open 'x-apple.systempreferences:com.apple.Profiles-Settings.extension' 2>/dev/null ||
+    open 'x-apple.systempreferences:com.apple.preferences.configurationprofiles' 2>/dev/null || true
+}
+
+wait_for_profile() {
+  local expected="$1" seconds=0
+  while (( seconds < 600 )); do
+    if profile_installed && [[ "$(profile_kept_csv || true)" == "$expected" ]]; then return 0; fi
+    sleep 2
+    seconds=$((seconds+2))
+  done
+  return 1
+}
+
+reset_models() {
+  local set failures=0
+  while IFS= read -r set; do
+    [[ -n "$set" ]] || continue
+    if "$HELPER" reset "$set"; then
+      info "reset: $set"
+    else
+      warn "asset reset failed: $set"
+      failures=$((failures+1))
+    fi
+  done <<< "$1"
+  return "$failures"
+}
+
+confirm() {
+  (( YES == 1 )) && return 0
+  [[ -t 0 ]] || fail 'run in a terminal or pass --yes'
+  printf 'Turn off Apple Intelligence and reset selected models? [y/N] '
+  read -r answer
+  [[ "$answer" =~ ^[Yy]([Ee][Ss])?$ ]]
+}
+
+off_command() {
+  parse_args "$@"
+  build_helper
+  if legacy_profile_installed || upstream_profile_installed; then
+    fail 'another RemoveMacAI profile is installed; remove it before using this implementation'
+  fi
+  validate_uaf_catalog
+  local sets="$(sets_to_remove)" feature expected
+  printf 'Features to disable:\n'
+  for feature in "${FEATURES[@]}"; do kept "$feature" || printf '  - %s\n' "$(feature_title "$feature")"; done
+  printf 'Model sets to reset:\n'
+  if [[ -n "$sets" ]]; then printf '%s\n' "$sets" | sed 's/^/  - /'; else printf '  - none\n'; fi
+
+  if (( DRY_RUN == 1 )); then
+    local dry="${TMPDIR:-/tmp}/Apple-AI-remover.$$.mobileconfig"
+    build_profile "$dry" "$sets"
+    info 'DRY RUN: no profile was installed and no model was reset.'
+    info "generated profile: $dry"
+    return 0
+  fi
+
+  confirm || { info 'Nothing changed.'; return 0; }
+  expected="$(printf '%s' "${KEEP[*]:-}" | tr ' ' ',')"
+  build_profile "$PROFILE_FILE" "$sets"
+  open "$PROFILE_FILE" 2>/dev/null || true
+  open_profile_settings
+  info "Approve '$PROFILE_NAME' in System Settings."
+  wait_for_profile "$expected" || fail 'profile installation was not observed; no model reset was attempted'
+
+  if [[ -n "$sets" ]]; then
+    reset_models "$sets" || fail 'one or more selected model sets failed to reset; run status to inspect the remaining state'
+  fi
+  info 'Done. Run: ./remove-mac-ai.sh status'
+}
+
+revert_command() {
+  build_helper
+  local current=0 legacy=0
+  profile_installed && current=1
+  legacy_profile_installed && legacy=1
+  if (( current == 0 && legacy == 0 )); then info 'No Apple AI remover profile is installed.'; return 0; fi
+  if (( YES == 0 )); then
+    [[ -t 0 ]] || fail 'run in a terminal or pass --yes'
+    printf 'Remove Apple AI remover profile(s)? [y/N] '
+    read -r answer
+    [[ "$answer" =~ ^[Yy]([Ee][Ss])?$ ]] || { info 'Nothing changed.'; return 0; }
+  fi
+  (( current == 1 )) && sudo /usr/bin/profiles remove -identifier "$PROFILE_ID"
+  (( legacy == 1 )) && sudo /usr/bin/profiles remove -identifier "$LEGACY_PROFILE_ID"
+  local seconds=0
+  while (( seconds < 120 )); do
+    ! profile_installed && ! legacy_profile_installed && { info 'Profile(s) removed.'; return 0; }
+    sleep 1
+    seconds=$((seconds+1))
+  done
+  fail 'profile removal was not observed after 120 seconds'
+}
+
+selftest_command() {
+  need_cmd shasum
+  need_cmd plutil
+  local feature set all test_keep tmp
+  for feature in "${FEATURES[@]}"; do
+    feature_title "$feature" >/dev/null || fail "missing title for $feature"
+    while IFS= read -r set; do
+      [[ -z "$set" ]] || model_set_asset_type "$set" >/dev/null || fail "unknown model set $set"
+    done < <(feature_model_sets "$feature")
+  done
+  for set in "${MODEL_SETS[@]}"; do model_set_asset_type "$set" >/dev/null || fail "missing model-set mapping $set"; done
+  KEEP=()
+  all="$(sets_to_remove)"
+  [[ "$(printf '%s\n' "$all" | sort)" == "$(printf '%s\n' "${MODEL_SETS[@]}" | sort)" ]] || fail 'empty keep set must remove every model set'
+  KEEP=(writing-tools)
+  all="$(sets_to_remove)"
+  grep -qx 'com.apple.modelcatalog' <<< "$all" && fail 'writing-tools must protect foundation models'
+  grep -qx 'com.apple.MobileAsset.UAF.FM.Visual' <<< "$all" || fail 'writing-tools must not protect visual models'
+  KEEP=()
+  test_keep="$(stable_uuid "$PROFILE_ID")"
+  [[ "$test_keep" == "$(stable_uuid "$PROFILE_ID")" ]] || fail 'payload UUIDs are not stable'
+  tmp="${TMPDIR:-/tmp}/apple-ai-remover-selftest.$$.mobileconfig"
+  build_profile "$tmp" "$(sets_to_remove)"
+  /usr/bin/plutil -lint "$tmp" >/dev/null 2>&1 || fail 'self-test profile is not valid plist'
+  grep -q 'DownloadServerBaseURLOverride-com.apple.MobileAsset.UAF.FM.GenerativeModels' "$tmp" || fail 'self-test profile lacks foundation model download override'
+  rm -f "$tmp"
+  printf 'selftest: PASS (%s features, %s model sets)\n' "${#FEATURES[@]}" "${#MODEL_SETS[@]}"
+}
+
+usage() {
+  cat <<EOF
+$PRODUCT_NAME $VERSION
+
+Usage:
+  $0 status
+  $0 features
+  $0 off [--keep feature[,feature...]] [--dry-run] [--yes]
+  $0 revert [--yes]
+  $0 selftest
+
+Mutating commands target macOS $TARGET_MAJOR.x on Apple silicon.
+EOF
+}
+
+main() {
+  local command="${1:-status}"
+  shift || true
+  case "$command" in
+    status) require_platform; status_command "$@" ;;
+    features) [[ $# -eq 0 ]] || fail 'features takes no options'; print_features ;;
+    off) require_platform; off_command "$@" ;;
+    revert) require_platform; parse_args "$@"; revert_command ;;
+    selftest) [[ $# -eq 0 ]] || fail 'selftest takes no options'; selftest_command ;;
+    --help|-h|help) usage ;;
+    --version|-v|version) echo "$VERSION" ;;
+    *) usage >&2; exit 1 ;;
+  esac
+}
+
+main "$@"
+\n'
+  done <<< "$sets"
   printf '%s' "$lines"
 }
 
