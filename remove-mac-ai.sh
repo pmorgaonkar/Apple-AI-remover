@@ -127,7 +127,7 @@ model_title() {
   esac
 }
 
-kept() { local x; for x in "${KEEP[@]}"; do [[ "$x" == "$1" ]] && return 0; done; return 1; }
+kept() { local x; for x in "${KEEP[@]:-}"; do [[ -n "$x" && "$x" == "$1" ]] && return 0; done; return 1; }
 
 parse_keep() {
   local raw="$1" old_ifs="$IFS" x
@@ -137,7 +137,7 @@ parse_keep() {
     x="$(printf '%s' "$x" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     [[ -z "$x" ]] && continue
     title "$x" >/dev/null || fail "unknown feature '$x'"
-    kept "$x" || KEEP=("${KEEP[@]}" "$x")
+    kept "$x" || KEEP+=("$x")
   done
 }
 
